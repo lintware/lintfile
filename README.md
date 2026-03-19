@@ -1,6 +1,9 @@
-# LintFile �ariant
+# 📲 LintFile
 
-A fast, privacy-first file and text sharing tool. Send files and text between your computer and phone instantly—no accounts, no cloud storage, no hassle.
+**Fast, privacy-first file and text sharing** — scan a QR code, send files instantly between devices. No accounts, no cloud, no hassle.
+
+![TypeScript](https://img.shields.io/badge/typescript-bun-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
 
 ![LintFile Interface](image.png)
 
