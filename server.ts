@@ -427,14 +427,32 @@ function addSentItem(text) {
 
 const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
 
+function formatBytes(bytes) {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let size = bytes;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit++;
+  }
+  return (unit === 0 ? size : size.toFixed(size >= 10 ? 0 : 1)) + units[unit];
+}
+
 async function uploadFiles(files) {
   if (!files.length) return;
   progress.classList.add('show');
 
+  let uploaded = 0;
+  let skipped = 0;
+  let failed = 0;
+
   for (let i = 0; i < files.length; i++) {
     const file = files[i];
     if (file.size > MAX_FILE_SIZE) {
+      skipped++;
+      progressText.textContent = 'Skipped: ' + file.name + ' (' + formatBytes(file.size) + ') exceeds 100MB limit';
       showToast(file.name + ' exceeds 100MB limit');
+      await new Promise(r => setTimeout(r, 1200));
       continue;
     }
     progressText.textContent = 'Uploading ' + (i + 1) + '/' + files.length + ': ' + file.name;
@@ -451,23 +469,32 @@ async function uploadFiles(files) {
         };
         xhr.onload = () => {
           if (xhr.status === 200) { addSentItem(file.name); resolve(); }
-          else if (xhr.status === 413) reject(new Error('File exceeds 100MB limit'))
+          else if (xhr.status === 413) reject(new Error('File exceeds 100MB limit'));
           else reject(new Error('Upload failed'));
         };
         xhr.onerror = () => reject(new Error('Network error'));
         xhr.open('POST', '/api/upload/' + sessionId);
         xhr.send(form);
       });
+      uploaded++;
     } catch (err) {
+      failed++;
       progressText.textContent = 'Error: ' + err.message;
       await new Promise(r => setTimeout(r, 2000));
     }
   }
 
-  progressBar.style.width = '100%';
-  progressText.textContent = 'Done!';
-  showToast(files.length > 1 ? files.length + ' files sent!' : 'File sent!');
-  setTimeout(() => { progress.classList.remove('show'); progressBar.style.width = '0%'; }, 1500);
+  progressBar.style.width = uploaded > 0 ? '100%' : '0%';
+
+  const parts = [];
+  if (uploaded) parts.push(uploaded + ' uploaded');
+  if (skipped) parts.push(skipped + ' skipped');
+  if (failed) parts.push(failed + ' failed');
+
+  const summary = parts.length ? parts.join(', ') : 'No files uploaded';
+  progressText.textContent = summary;
+  showToast(summary);
+  setTimeout(() => { progress.classList.remove('show'); progressBar.style.width = '0%'; }, 2500);
 }
 
 document.getElementById('uploadBtn').onclick = () => fileInput.click();
