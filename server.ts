@@ -1,6 +1,8 @@
 import { randomUUIDv7 } from "bun";
 import QRCode from "qrcode";
 import { networkInterfaces } from "os";
+import { mkdir, appendFile, rm, stat } from "fs/promises";
+import { join } from "path";
 
 // --- Types ---
 
@@ -9,7 +11,8 @@ interface StoredFile {
   name: string;
   type: string;
   size: number;
-  data: Buffer;
+  data?: Buffer;
+  path?: string;
   createdAt: number;
 }
 
@@ -30,6 +33,7 @@ interface Session {
 
 const sessions = new Map<string, Session>();
 const wsClients = new Map<string, Set<WebSocket>>();
+const STORAGE_DIR = process.env.STORAGE_DIR || join(process.cwd(), ".lintfile-storage");
 
 function getOrCreateSession(id?: string): Session {
   if (id && sessions.has(id)) return sessions.get(id)!;
@@ -425,7 +429,9 @@ function addSentItem(text) {
   sentList.prepend(div);
 }
 
-const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
+const SINGLE_UPLOAD_LIMIT = 90 * 1024 * 1024; // stay below Cloudflare 100MB request limit
+const MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024; // 2GB per file
+const CHUNK_SIZE = 8 * 1024 * 1024; // 8MB chunks for large files
 
 function formatBytes(bytes) {
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
@@ -450,32 +456,68 @@ async function uploadFiles(files) {
     const file = files[i];
     if (file.size > MAX_FILE_SIZE) {
       skipped++;
-      progressText.textContent = 'Skipped: ' + file.name + ' (' + formatBytes(file.size) + ') exceeds 100MB limit';
-      showToast(file.name + ' exceeds 100MB limit');
+      progressText.textContent = 'Skipped: ' + file.name + ' (' + formatBytes(file.size) + ') exceeds 2GB limit';
+      showToast(file.name + ' exceeds 2GB limit');
       await new Promise(r => setTimeout(r, 1200));
       continue;
     }
     progressText.textContent = 'Uploading ' + (i + 1) + '/' + files.length + ': ' + file.name;
     progressBar.style.width = '0%';
 
-    const form = new FormData();
-    form.append('file', file);
-
     try {
-      const xhr = new XMLHttpRequest();
-      await new Promise((resolve, reject) => {
-        xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable) progressBar.style.width = Math.round(e.loaded / e.total * 100) + '%';
-        };
-        xhr.onload = () => {
-          if (xhr.status === 200) { addSentItem(file.name); resolve(); }
-          else if (xhr.status === 413) reject(new Error('File exceeds 100MB limit'));
-          else reject(new Error('Upload failed'));
-        };
-        xhr.onerror = () => reject(new Error('Network error'));
-        xhr.open('POST', '/api/upload/' + sessionId);
-        xhr.send(form);
-      });
+      if (file.size > SINGLE_UPLOAD_LIMIT) {
+        const fileId = crypto.randomUUID();
+        const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+        for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+          const start = chunkIndex * CHUNK_SIZE;
+          const chunk = file.slice(start, Math.min(start + CHUNK_SIZE, file.size));
+          const form = new FormData();
+          form.append('fileId', fileId);
+          form.append('name', file.name);
+          form.append('type', file.type || 'application/octet-stream');
+          form.append('size', String(file.size));
+          form.append('chunkIndex', String(chunkIndex));
+          form.append('totalChunks', String(totalChunks));
+          form.append('chunk', chunk);
+
+          await new Promise((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.upload.onprogress = (e) => {
+              if (e.lengthComputable) {
+                const loaded = start + e.loaded;
+                progressBar.style.width = Math.min(100, Math.round(loaded / file.size * 100)) + '%';
+              }
+            };
+            xhr.onload = () => {
+              if (xhr.status === 200) resolve();
+              else reject(new Error('Chunk upload failed'));
+            };
+            xhr.onerror = () => reject(new Error('Network error'));
+            xhr.open('POST', '/api/upload-chunk/' + sessionId);
+            xhr.send(form);
+          });
+          progressText.textContent = 'Uploading ' + file.name + ' chunk ' + (chunkIndex + 1) + '/' + totalChunks;
+        }
+        addSentItem(file.name);
+      } else {
+        const form = new FormData();
+        form.append('file', file);
+
+        const xhr = new XMLHttpRequest();
+        await new Promise((resolve, reject) => {
+          xhr.upload.onprogress = (e) => {
+            if (e.lengthComputable) progressBar.style.width = Math.round(e.loaded / e.total * 100) + '%';
+          };
+          xhr.onload = () => {
+            if (xhr.status === 200) { addSentItem(file.name); resolve(); }
+            else if (xhr.status === 413) reject(new Error('File exceeds server limit'));
+            else reject(new Error('Upload failed'));
+          };
+          xhr.onerror = () => reject(new Error('Network error'));
+          xhr.open('POST', '/api/upload/' + sessionId);
+          xhr.send(form);
+        });
+      }
       uploaded++;
     } catch (err) {
       failed++;
@@ -541,6 +583,7 @@ dropZone.onclick = () => fileInput.click();
 
 const PORT = parseInt(process.env.PORT || "8473");
 const PUBLIC_HOST = process.env.PUBLIC_HOST || "";
+const SERVER_MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024; // 2GB
 const localIP = getLocalIP();
 
 const server = Bun.serve({
@@ -569,13 +612,13 @@ const server = Bun.serve({
       const session = sessions.get(sessionId);
       if (!session) return new Response("Session not found", { status: 404 });
 
-      const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB
+      const MAX_FILE_SIZE = 100 * 1024 * 1024; // normal upload endpoint; larger files use chunks
 
       const formData = await req.formData();
       const file = formData.get("file") as File | null;
       if (!file) return new Response("No file provided", { status: 400 });
       if (file.size > MAX_FILE_SIZE) {
-        return Response.json({ error: "File exceeds 100MB limit" }, { status: 413 });
+        return Response.json({ error: "File exceeds normal upload limit; use chunked upload" }, { status: 413 });
       }
 
       const buffer = Buffer.from(await file.arrayBuffer());
@@ -599,6 +642,69 @@ const server = Bun.serve({
       });
 
       return Response.json({ ok: true, id: storedFile.id });
+    }
+
+    // Chunked file upload for files larger than the public proxy request limit
+    if (path.startsWith("/api/upload-chunk/") && req.method === "POST") {
+      const sessionId = path.slice(18);
+      const session = sessions.get(sessionId);
+      if (!session) return new Response("Session not found", { status: 404 });
+
+      const formData = await req.formData();
+      const fileId = String(formData.get("fileId") || "");
+      const name = String(formData.get("name") || "file");
+      const type = String(formData.get("type") || "application/octet-stream");
+      const size = Number(formData.get("size") || 0);
+      const chunkIndex = Number(formData.get("chunkIndex") || 0);
+      const totalChunks = Number(formData.get("totalChunks") || 0);
+      const chunk = formData.get("chunk") as File | null;
+
+      if (!/^[a-zA-Z0-9._-]+$/.test(fileId)) return new Response("Invalid file id", { status: 400 });
+      if (!chunk || !Number.isFinite(size) || size <= 0 || size > SERVER_MAX_FILE_SIZE) {
+        return new Response("Invalid chunk upload", { status: 400 });
+      }
+      if (!Number.isInteger(chunkIndex) || !Number.isInteger(totalChunks) || chunkIndex < 0 || totalChunks <= 0 || chunkIndex >= totalChunks) {
+        return new Response("Invalid chunk index", { status: 400 });
+      }
+
+      const sessionDir = join(STORAGE_DIR, sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      const filePath = join(sessionDir, fileId);
+      if (chunkIndex === 0) await rm(filePath, { force: true });
+
+      const buffer = Buffer.from(await chunk.arrayBuffer());
+      await appendFile(filePath, buffer);
+
+      if (chunkIndex === totalChunks - 1) {
+        const info = await stat(filePath);
+        if (info.size !== size) {
+          await rm(filePath, { force: true });
+          return Response.json({ error: "Uploaded size mismatch" }, { status: 400 });
+        }
+
+        const storedFile: StoredFile = {
+          id: fileId,
+          name,
+          type,
+          size,
+          path: filePath,
+          createdAt: Date.now(),
+        };
+        session.files.push(storedFile);
+
+        broadcast(sessionId, {
+          type: "file",
+          id: storedFile.id,
+          name: storedFile.name,
+          mime: storedFile.type,
+          size: storedFile.size,
+          createdAt: storedFile.createdAt,
+        });
+
+        return Response.json({ ok: true, id: storedFile.id, complete: true });
+      }
+
+      return Response.json({ ok: true, id: fileId, complete: false });
     }
 
     // Text send
@@ -638,7 +744,10 @@ const server = Bun.serve({
       const file = session.files.find((f) => f.id === fileId);
       if (!file) return new Response("File not found", { status: 404 });
 
-      return new Response(file.data, {
+      const body = file.path ? Bun.file(file.path) : file.data;
+      if (!body) return new Response("File data missing", { status: 404 });
+
+      return new Response(body, {
         headers: {
           "Content-Type": file.type || "application/octet-stream",
           "Content-Disposition": `inline; filename="${file.name}"`,
